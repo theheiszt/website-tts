@@ -1,0 +1,351 @@
+"""
+StoryVox Voice Studio
+=====================
+A tool for designing and exploring Supertonic 3 voice styles.
+
+Three ways to create voices:
+  1. Voice Mixer   — blend the 10 built-ins with weighted sliders
+  2. Space Explorer — navigate the PCA voice space with component sliders
+  3. Presets        — load and preview any built-in voice directly
+
+All voices save as JSON files compatible with StoryVox Pro's custom voice folder.
+
+Usage:
+    python voice_studio.py
+    python voice_studio.py --model-dir "D:/Projects/StoryVoxPro/models/tts/supertonic3"
+    python voice_studio.py --port 7861
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+import gradio as gr
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Built-in voice catalogue
+# ---------------------------------------------------------------------------
+
+BUILTIN_VOICES = {
+    "M1": "Lively, upbeat — promotional & energetic",
+    "M2": "Deep, composed — corporate & documentary",
+    "M3": "Authoritative, polished — business & presentations",
+    "M4": "Friendly, youthful — educational & casual",
+    "M5": "Warm, soft-spoken — audiobooks & reflective",
+    "F1": "Calm, steady — customer service & guided",
+    "F2": "Bright, playful — youth & entertainment",
+    "F3": "Professional announcer — news & commercials",
+    "F4": "Confident, expressive — business explainers",
+    "F5": "Kind, gentle — wellness & soothing",
+}
+
+MALE_VOICES   = ["M1", "M2", "M3", "M4", "M5"]
+FEMALE_VOICES = ["F1", "F2", "F3", "F4", "F5"]
+ALL_VOICES    = MALE_VOICES + FEMALE_VOICES
+
+DEFAULT_TEXT = (
+    "The old lighthouse stood alone on the cliff, its beam cutting through "
+    "the fog like a whisper from another world."
+)
+
+
+# ---------------------------------------------------------------------------
+# VoiceEngine
+# ---------------------------------------------------------------------------
+
+class VoiceEngine:
+    """Loads Supertonic 3, holds all built-in voice arrays, and provides
+    blending, PCA navigation, synthesis, and save operations."""
+
+    def __init__(self, model_dir: str | None = None):
+        from supertonic import TTS
+        from supertonic.loader import load_voice_style_from_name
+
+        print("Loading Supertonic 3 model...")
+        self.tts = TTS(model_dir=model_dir) if model_dir else TTS()
+        self.model_dir   = self.tts.model_dir
+        self.sample_rate = self.tts.sample_rate
+
+        print("Loading built-in voice styles...")
+        self.ttl = {}
+        self.dp  = {}
+        for name in ALL_VOICES:
+            style = load_voice_style_from_name(self.model_dir, name)
+            self.ttl[name] = style.ttl.copy()
+            self.dp[name]  = style.dp.copy()
+
+        print("Computing voice space...")
+        self._compute_pca()
+        print("Voice Studio ready.\n")
+
+    def _compute_pca(self):
+        X = np.stack([self.ttl[n].flatten() for n in ALL_VOICES])
+        self.mean_ttl = X.mean(axis=0)
+        Xc = X - self.mean_ttl
+        _, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+        self.pca_components = Vt
+        self.pca_variance   = (S ** 2) / (S ** 2).sum()
+        self.voice_coords   = Xc @ Vt.T
+
+        Xdp = np.stack([self.dp[n].flatten() for n in ALL_VOICES])
+        self.mean_dp = Xdp.mean(axis=0)
+
+    def blend(self, weights: dict):
+        from supertonic.core import Style
+        total = sum(max(0.0, w) for w in weights.values())
+        if total == 0:
+            ttl = self.mean_ttl.reshape(1, 50, 256).astype(np.float32)
+            dp  = self.mean_dp.reshape(1,  8,  16).astype(np.float32)
+            return Style(ttl, dp)
+        ttl = np.zeros((1, 50, 256), dtype=np.float32)
+        dp  = np.zeros((1,  8,  16), dtype=np.float32)
+        for name, w in weights.items():
+            w = max(0.0, float(w))
+            if w > 0 and name in self.ttl:
+                nw = w / total
+                ttl += nw * self.ttl[name]
+                dp  += nw * self.dp[name]
+        return Style(ttl, dp)
+
+    def pc_to_style(self, pc_values: list):
+        from supertonic.core import Style
+        ttl_flat = self.mean_ttl.copy()
+        for i, v in enumerate(pc_values):
+            if i < len(self.pca_components):
+                ttl_flat += float(v) * self.pca_components[i]
+        ttl = np.clip(ttl_flat, -2.0, 2.0).reshape(1, 50, 256).astype(np.float32)
+        dp  = self.mean_dp.reshape(1, 8, 16).astype(np.float32)
+        return Style(ttl, dp)
+
+    def preset(self, name: str):
+        from supertonic.core import Style
+        return Style(self.ttl[name].copy(), self.dp[name].copy())
+
+    def synthesize(self, text: str, style, steps: int = 8, speed: float = 1.05):
+        if not text.strip():
+            text = DEFAULT_TEXT
+        wav, _ = self.tts.synthesize(
+            text, style, total_steps=steps, speed=speed, lang="en"
+        )
+        wav_np = wav.squeeze()
+        wav_int16 = (np.clip(wav_np, -1.0, 1.0) * 32767).astype(np.int16)
+        return self.sample_rate, wav_int16
+
+    def save(self, style, name: str, output_dir: Path) -> str:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in name).strip()
+        if not safe:
+            safe = "custom_voice"
+        filepath = output_dir / f"{safe}.json"
+        payload = {
+            "style_ttl": {"dims": list(style.ttl.shape), "data": style.ttl.tolist()},
+            "style_dp":  {"dims": list(style.dp.shape),  "data": style.dp.tolist()},
+        }
+        with open(filepath, "w") as f:
+            json.dump(payload, f)
+        return str(filepath)
+
+
+# ---------------------------------------------------------------------------
+# Gradio UI
+# ---------------------------------------------------------------------------
+
+def build_ui(engine: VoiceEngine, output_dir: Path):
+    pct = [f"{v * 100:.1f}%" for v in engine.pca_variance[:4]]
+    pc_max = max(float(np.abs(engine.voice_coords[:, :4]).max()) * 1.6, 2.0)
+
+    theme = gr.themes.Soft(
+        primary_hue="slate",
+        secondary_hue="blue",
+        font=gr.themes.GoogleFont("Inter"),
+    )
+
+    with gr.Blocks(title="StoryVox Voice Studio") as app:
+
+        gr.Markdown(
+            "# 🎙️ StoryVox Voice Studio\n"
+            "Design Supertonic 3 voice styles — blend, explore, and save as JSON."
+        )
+
+        staged_style = gr.State(value=None)
+
+        with gr.Tabs():
+
+            # TAB 1 — VOICE MIXER
+            with gr.TabItem("🎚️ Voice Mixer"):
+                gr.Markdown(
+                    "Set a weight for each voice. Weights are normalised automatically — "
+                    "only the *ratio* between sliders matters."
+                )
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("### ♂ Male")
+                        m_sliders = {
+                            n: gr.Slider(0, 1, value=0, step=0.01,
+                                         label=f"{n}  ·  {BUILTIN_VOICES[n]}")
+                            for n in MALE_VOICES
+                        }
+                    with gr.Column():
+                        gr.Markdown("### ♀ Female")
+                        f_sliders = {
+                            n: gr.Slider(0, 1, value=0, step=0.01,
+                                         label=f"{n}  ·  {BUILTIN_VOICES[n]}")
+                            for n in FEMALE_VOICES
+                        }
+                with gr.Row():
+                    mix_btn    = gr.Button("🔊 Preview Blend", variant="primary")
+                    mix_random = gr.Button("🎲 Randomise", variant="secondary")
+                blend_info = gr.Textbox(label="Effective blend", interactive=False)
+
+            # TAB 2 — SPACE EXPLORER
+            with gr.TabItem("🧭 Space Explorer"):
+                gr.Markdown(
+                    "Navigate the voice space using Principal Components — the real axes "
+                    "of variation across the 10 built-in voices.  \n"
+                    "**All sliders at zero = the mean of all voices.**"
+                )
+                coord_lines = []
+                for i, n in enumerate(ALL_VOICES):
+                    c = engine.voice_coords[i]
+                    coord_lines.append(
+                        f"**{n}** ({BUILTIN_VOICES[n].split('—')[0].strip()}): "
+                        f"PC1={c[0]:+.2f}  PC2={c[1]:+.2f}  "
+                        f"PC3={c[2]:+.2f}  PC4={c[3]:+.2f}"
+                    )
+                with gr.Accordion("Voice map — where built-ins sit in PC space", open=False):
+                    gr.Markdown("\n\n".join(coord_lines))
+                pc_sliders = [
+                    gr.Slider(-pc_max, pc_max, value=0.0, step=0.05,
+                              label=f"PC{i+1}  ({pct[i]} of total voice variation)")
+                    for i in range(4)
+                ]
+                pc_btn = gr.Button("🔊 Preview Position", variant="primary")
+
+            # TAB 3 — PRESETS
+            with gr.TabItem("🎭 Built-in Presets"):
+                gr.Markdown("Load a built-in voice directly — no blending.")
+                preset_dd = gr.Dropdown(
+                    choices=[(f"{n}  ·  {BUILTIN_VOICES[n]}", n) for n in ALL_VOICES],
+                    value="M5",
+                    label="Voice",
+                )
+                preset_btn = gr.Button("Load & Preview", variant="primary")
+
+        # SHARED PREVIEW / SAVE
+        gr.Markdown("---")
+        gr.Markdown("## 🔊 Preview  &  💾 Save")
+        with gr.Row():
+            with gr.Column(scale=3):
+                preview_text = gr.Textbox(value=DEFAULT_TEXT, label="Preview text", lines=3)
+            with gr.Column(scale=1):
+                steps_sl = gr.Slider(4, 12, value=8,    step=1,    label="Quality steps")
+                speed_sl = gr.Slider(0.7, 1.5, value=1.05, step=0.05, label="Speed")
+        audio_out = gr.Audio(label="Output", type="numpy")
+        with gr.Row():
+            name_box = gr.Textbox(label="Voice name", placeholder="Deep Narrator", scale=3)
+            save_btn = gr.Button("💾 Save JSON", variant="secondary", scale=1)
+        status_box = gr.Textbox(label="Status", interactive=False)
+
+        # EVENT HANDLERS
+        all_slider_inputs = (
+            [m_sliders[n] for n in MALE_VOICES] +
+            [f_sliders[n] for n in FEMALE_VOICES]
+        )
+
+        def _mix(text, steps, speed, *vals):
+            weights = {n: float(v) for n, v in zip(ALL_VOICES, vals)}
+            style   = engine.blend(weights)
+            total   = sum(max(0.0, v) for v in vals)
+            if total > 0:
+                parts = [f"{n} {max(0.0,w)/total*100:.0f}%"
+                         for n, w in weights.items() if w > 0]
+                info = "  +  ".join(parts)
+            else:
+                info = "Mean of all voices"
+            audio = engine.synthesize(text, style, int(steps), float(speed))
+            return audio, style, info
+
+        mix_btn.click(
+            fn=_mix,
+            inputs=[preview_text, steps_sl, speed_sl] + all_slider_inputs,
+            outputs=[audio_out, staged_style, blend_info],
+        )
+
+        def _randomise():
+            vals = np.random.dirichlet(np.ones(10)).tolist()
+            return vals
+
+        mix_random.click(
+            fn=_randomise,
+            inputs=[],
+            outputs=list(m_sliders.values()) + list(f_sliders.values()),
+        )
+
+        def _pc_preview(text, steps, speed, *pc_vals):
+            style = engine.pc_to_style(list(pc_vals))
+            audio = engine.synthesize(text, style, int(steps), float(speed))
+            return audio, style
+
+        pc_btn.click(
+            fn=_pc_preview,
+            inputs=[preview_text, steps_sl, speed_sl] + pc_sliders,
+            outputs=[audio_out, staged_style],
+        )
+
+        def _preset(name, text, steps, speed):
+            style = engine.preset(name)
+            audio = engine.synthesize(text, style, int(steps), float(speed))
+            return audio, style
+
+        preset_btn.click(
+            fn=_preset,
+            inputs=[preset_dd, preview_text, steps_sl, speed_sl],
+            outputs=[audio_out, staged_style],
+        )
+
+        def _save(style, name):
+            if style is None:
+                return "⚠️  Generate a preview first — nothing is staged yet."
+            if not name.strip():
+                return "⚠️  Enter a name before saving."
+            path = engine.save(style, name.strip(), output_dir)
+            return f"✅  Saved → {path}"
+
+        save_btn.click(
+            fn=_save,
+            inputs=[staged_style, name_box],
+            outputs=[status_box],
+        )
+
+    return app, theme
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="StoryVox Voice Studio")
+    parser.add_argument("--model-dir", default=None,
+                        help="Path to Supertonic 3 model directory.")
+    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--output-dir", default="voices",
+                        help="Folder where saved voice JSONs are written.")
+    args = parser.parse_args()
+
+    try:
+        engine = VoiceEngine(model_dir=args.model_dir)
+    except ImportError:
+        print("\n  ERROR: supertonic is not installed.\n  Run: pip install supertonic\n")
+        raise SystemExit(1)
+
+    output_dir = Path(args.output_dir)
+    app, theme = build_ui(engine, output_dir)
+    print(f"Saving voices to: {output_dir.resolve()}")
+    app.launch(server_port=args.port, share=False, inbrowser=True, theme=theme)
+
+
+if __name__ == "__main__":
+    main()

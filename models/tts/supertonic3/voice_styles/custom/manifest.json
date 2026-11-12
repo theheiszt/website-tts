@@ -1,0 +1,8 @@
+{
+    "voices": [
+        {
+            "filepath": "D:/Projects/StoryVoxPro/out/build/x64-Release/Release/models/tts/supertonic3/voice_styles/custom/Jennie_clone_clip.json",
+            "label": "Jennie clone clip"
+        }
+    ]
+}

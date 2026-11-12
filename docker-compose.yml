@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  aig-tts:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: aigirl-fans/tts-service:latest
+    container_name: aigirl-tts
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8880}:8880"
+    environment:
+      - PORT=8880
+      - HOST=0.0.0.0
+      - MODEL_DIR=/app/models/tts/supertonic3
+      - TTS_API_KEY=${TTS_API_KEY:-}
+      - DEFAULT_STEPS=${DEFAULT_STEPS:-12}
+      - CACHE_SIZE=${CACHE_SIZE:-1000}
+    volumes:
+      # Mount custom voices volume so user-cloned voices persist across container restarts
+      - ./models/tts/supertonic3/voice_styles/custom:/app/models/tts/supertonic3/voice_styles/custom
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8880/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 3

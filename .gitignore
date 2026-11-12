@@ -1,0 +1,25 @@
+# Python & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+venv/
+env/
+.venv/
+
+# Windows Desktop & App Binaries (StoryVox Pro Desktop Client)
+*.dll
+*.exe
+PythonVoiceStudio/
+PythonVoiceStudio.zip
+models.7z
+FFmpeg/
+generic/
+mp4v2/
+multimedia/
+styles/
+tls/
+
+# Temporary test audio
+test_output.wav

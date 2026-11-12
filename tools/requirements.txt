@@ -1,0 +1,3 @@
+supertonic
+gradio>=4.0
+numpy
